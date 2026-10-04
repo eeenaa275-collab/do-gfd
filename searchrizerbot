@@ -1,0 +1,1391 @@
+import os, re, json, html, time, shutil, asyncio, tempfile, subprocess, random, string
+import zipfile, tarfile, gzip, bz2, lzma
+from datetime import datetime, timedelta, timezone
+import chardet
+from telethon import TelegramClient, events, Button
+
+# ================= НАСТРОЙКИ =================
+API_ID = 35818388
+API_HASH = "cdc263525abccc409dd160962adbb08e"
+BOT_TOKEN = "8855289263:AAH8FtwXPVVRZaQVEGOEiXU4Wiq5M_ElL3g"
+OWNER_ID = 8174421672
+
+# Путь к логотипу (лежит рядом со скриптом)
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.jpg")
+
+# Поддержка
+SUPPORT_USERNAME = "fuckrizer"
+SUPPORT_LINK = f"https://t.me/{SUPPORT_USERNAME}"
+
+SUB_PRICES = {
+    "day":    {"name": "1 день",    "price": 50,   "days": 1},
+    "week":   {"name": "7 дней",    "price": 250,  "days": 7},
+    "month":  {"name": "30 дней",   "price": 700,  "days": 30},
+    "forever":{"name": "Навсегда",  "price": 2000, "days": 36500},
+}
+# =============================================
+
+DATA_DIR = os.path.expanduser("~/osint_data")
+DB_DIR = os.path.join(DATA_DIR, "bases")
+TMP_DIR = os.path.join(DATA_DIR, "tmp")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+PROMOS_FILE = os.path.join(DATA_DIR, "promos.json")
+STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+BROADCAST_FILE = os.path.join(DATA_DIR, "broadcast.json")
+
+for d in (DB_DIR, TMP_DIR):
+    os.makedirs(d, exist_ok=True)
+
+PREVIEW = 10
+MAX_RESULTS = 500_000
+MAX_DEPTH = 5
+DAILY_FREE = 3
+REF_BONUS = 5
+MSK = timezone(timedelta(hours=3))
+
+ARCHIVE_EXT = (".zip", ".7z", ".rar", ".tar", ".tgz", ".tar.gz", ".tar.bz2",
+               ".tbz2", ".tar.xz", ".txz", ".gz", ".bz2", ".xz")
+
+scope = {"db": None}
+STARTED = time.time()
+
+
+# ================= ХРАНИЛИЩА =================
+def _load(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+stats = _load(STATS_FILE, {"searches": 0, "uploads": 0, "last_query": "—"})
+users = _load(USERS_FILE, {})
+promos = _load(PROMOS_FILE, {})
+history = _load(HISTORY_FILE, {})
+broadcast = _load(BROADCAST_FILE, {"running": False, "text": "", "total": 0, "sent": 0, "failed": 0})
+
+
+def save_stats(): _save(STATS_FILE, stats)
+def save_users(): _save(USERS_FILE, users)
+def save_promos(): _save(PROMOS_FILE, promos)
+def save_history(): _save(HISTORY_FILE, history)
+def save_broadcast(): _save(BROADCAST_FILE, broadcast)
+
+
+def today_msk():
+    return datetime.now(MSK).strftime("%Y-%m-%d")
+
+
+def touch_history(field, inc=1):
+    d = today_msk()
+    if d not in history:
+        history[d] = {"searches": 0, "new_users": 0, "active_users": []}
+    history[d][field] = history[d].get(field, 0) + inc
+    save_history()
+
+
+def mark_active(uid):
+    d = today_msk()
+    if d not in history:
+        history[d] = {"searches": 0, "new_users": 0, "active_users": []}
+    if uid not in history[d].get("active_users", []):
+        history[d].setdefault("active_users", []).append(uid)
+        save_history()
+
+
+# ================= ПОЛЬЗОВАТЕЛИ =================
+def get_user(uid, username=None):
+    uid = str(uid)
+    is_new = uid not in users
+    if is_new:
+        users[uid] = {
+            "id": uid,
+            "username": username or "",
+            "balance": 0,
+            "last_free": "",
+            "used_today": 0,
+            "total_searches": 0,
+            "ref_by": None,
+            "refs": [],
+            "created": int(time.time()),
+            "sub_until": 0,
+            "banned": False,
+            "ban_reason": "",
+        }
+        save_users()
+        touch_history("new_users")
+    if username:
+        users[uid]["username"] = username
+    return users[uid]
+
+
+def is_banned(u):
+    return bool(u.get("banned"))
+
+
+def has_sub(u):
+    return int(u.get("sub_until", 0)) > int(time.time())
+
+
+def sub_time_left(u):
+    left = int(u.get("sub_until", 0)) - int(time.time())
+    return max(0, left)
+
+
+def human_time(sec):
+    sec = int(sec)
+    d = sec // 86400
+    h = sec % 86400 // 3600
+    m = sec % 3600 // 60
+    if d > 0:
+        return f"{d} д {h} ч"
+    if h > 0:
+        return f"{h} ч {m} мин"
+    return f"{m} мин"
+
+
+def free_left(u):
+    if u.get("last_free") != today_msk():
+        return DAILY_FREE
+    return max(0, DAILY_FREE - u.get("used_today", 0))
+
+
+def total_left(u):
+    if has_sub(u):
+        return 999999
+    return free_left(u) + int(u.get("balance", 0))
+
+
+def consume_query(u):
+    if has_sub(u):
+        u["total_searches"] = u.get("total_searches", 0) + 1
+        save_users()
+        return True
+    today = today_msk()
+    if u.get("last_free") != today:
+        u["last_free"] = today
+        u["used_today"] = 0
+    if u.get("used_today", 0) < DAILY_FREE:
+        u["used_today"] = u.get("used_today", 0) + 1
+        u["total_searches"] = u.get("total_searches", 0) + 1
+        save_users()
+        return True
+    if int(u.get("balance", 0)) > 0:
+        u["balance"] = int(u["balance"]) - 1
+        u["total_searches"] = u.get("total_searches", 0) + 1
+        save_users()
+        return True
+    return False
+
+
+def add_sub(uid, days):
+    u = get_user(uid)
+    base = max(int(u.get("sub_until", 0)), int(time.time()))
+    u["sub_until"] = base + days * 86400
+    save_users()
+    return u["sub_until"]
+
+
+# ================= УТИЛИТЫ =================
+def hs(n):
+    n = float(n or 0)
+    for u in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if n < 1024:
+            return f"{n:.0f} {u}" if u == "Б" else f"{n:.1f} {u}"
+        n /= 1024
+    return f"{n:.1f} ПБ"
+
+
+def bar(p):
+    n = max(0, min(10, p // 10))
+    return "▰" * n + "▱" * (10 - n)
+
+
+def safe(name):
+    name = re.sub(r"[^\w\-. ]", "_", name, flags=re.UNICODE).strip(" .")
+    return name[:80] or "base"
+
+
+def esc(s):
+    return html.escape(str(s))
+
+
+def list_bases():
+    return sorted(d for d in os.listdir(DB_DIR) if os.path.isdir(os.path.join(DB_DIR, d)))
+
+
+def base_info(name):
+    files = size = 0
+    for r, _, fs in os.walk(os.path.join(DB_DIR, name)):
+        for f in fs:
+            files += 1
+            size += os.path.getsize(os.path.join(r, f))
+    return files, size
+
+
+def is_archive(p):
+    return p.lower().endswith(ARCHIVE_EXT)
+
+
+# ================= РАСПАКОВКА =================
+def extract(path, dest):
+    n = path.lower()
+    os.makedirs(dest, exist_ok=True)
+    if n.endswith(".zip"):
+        with zipfile.ZipFile(path) as z:
+            z.extractall(dest)
+    elif n.endswith((".7z", ".rar")):
+        try:
+            if n.endswith(".7z"):
+                import py7zr
+                with py7zr.SevenZipFile(path) as z:
+                    z.extractall(dest)
+            else:
+                import rarfile
+                with rarfile.RarFile(path) as z:
+                    z.extractall(dest)
+        except ImportError:
+            exe = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz")
+            if not exe:
+                raise RuntimeError("нет 7z: pkg install p7zip")
+            subprocess.run([exe, "x", "-y", f"-o{dest}", path], check=True,
+                           stdout=subprocess.DEVNULL)
+    elif n.endswith((".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        with tarfile.open(path) as t:
+            t.extractall(dest)
+    elif n.endswith((".gz", ".bz2", ".xz")):
+        op = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}[os.path.splitext(n)[1]]
+        with op(path, "rb") as s, open(os.path.join(dest, os.path.basename(path).rsplit(".", 1)[0]), "wb") as d:
+            shutil.copyfileobj(s, d)
+
+
+def to_text(path, out):
+    low = path.lower()
+    if low.endswith((".xlsx", ".xlsm")):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                out.write("\t".join("" if c is None else str(c) for c in row) + "\n")
+    elif low.endswith(".docx"):
+        import docx
+        d = docx.Document(path)
+        for p in d.paragraphs:
+            out.write(p.text + "\n")
+        for t in d.tables:
+            for r in t.rows:
+                out.write("\t".join(c.text for c in r.cells) + "\n")
+    elif low.endswith(".pdf"):
+        from pypdf import PdfReader
+        for pg in PdfReader(path).pages:
+            out.write((pg.extract_text() or "") + "\n")
+    else:
+        with open(path, "rb") as f:
+            head = f.read(65536)
+        if b"\x00" in head:
+            return False
+        enc = chardet.detect(head)["encoding"] or "utf-8"
+        with open(path, "r", encoding=enc, errors="replace") as f:
+            shutil.copyfileobj(f, out, 1 << 20)
+    return True
+
+
+def process_upload(src, name, dbname):
+    dest = os.path.join(DB_DIR, dbname)
+    os.makedirs(dest, exist_ok=True)
+    st = {"added": 0, "skipped": 0, "bytes": 0}
+
+    def handle(path, rel, depth):
+        if is_archive(path) and depth < MAX_DEPTH:
+            try:
+                d = path + "_x"
+                extract(path, d)
+                for r, _, fs in os.walk(d):
+                    for fn in fs:
+                        p = os.path.join(r, fn)
+                        handle(p, os.path.relpath(p, d), depth + 1)
+            except Exception:
+                st["skipped"] += 1
+            return
+        out_path = os.path.join(dest, safe(rel.replace(os.sep, "__")))
+        if os.path.exists(out_path):
+            out_path += f"_{int(time.time() * 1000)}"
+        try:
+            with open(out_path, "w", encoding="utf-8", newline="\n") as out:
+                ok = to_text(path, out)
+        except Exception:
+            ok = False
+        if ok:
+            st["added"] += 1
+            st["bytes"] += os.path.getsize(out_path)
+        else:
+            st["skipped"] += 1
+            if os.path.exists(out_path):
+                os.remove(out_path)
+
+    handle(src, name, 0)
+    return st
+
+
+# ================= ПОИСК =================
+def py_scan(q, target):
+    ql = q.lower()
+    root = os.path.join(DB_DIR, target) if target != "." else DB_DIR
+    for r, _, fs in os.walk(root):
+        for fn in fs:
+            p = os.path.join(r, fn)
+            rel = os.path.relpath(p, DB_DIR)
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if ql in line.lower():
+                        yield f"{rel}:{line.rstrip(chr(10))}"
+
+
+def run_search(query, dbname):
+    t0 = time.time()
+    res_path = os.path.join(tempfile.mkdtemp(dir=TMP_DIR), "results.txt")
+    target = dbname or "."
+    variants = {query, query.lower(), query.upper(), query.capitalize(), query.title(), query.swapcase()}
+    if shutil.which("grep"):
+        cmd = ["grep", "-r", "-a", "-i", "-F", "-H"]
+        for v in variants:
+            cmd += ["-e", v]
+        cmd += ["--", target]
+        proc = subprocess.Popen(cmd, cwd=DB_DIR, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        it = (l.decode("utf-8", "replace").rstrip("\n") for l in proc.stdout)
+    else:
+        proc = None
+        it = py_scan(query, target)
+
+    count, preview, seen = 0, [], set()
+    with open(res_path, "w", encoding="utf-8") as out:
+        for line in it:
+            path, _, text = line.partition(":")
+            path = path[2:] if path.startswith("./") else path
+            base, _, fname = path.partition("/")
+            key = hash((base, text))
+            if key in seen:
+                continue
+            seen.add(key)
+            count += 1
+            out.write(f"[{base}/{fname}] {text}\n")
+            if len(preview) < PREVIEW:
+                preview.append((base, fname, text))
+            if count >= MAX_RESULTS:
+                break
+    if proc:
+        proc.kill()
+    return count, preview, res_path, time.time() - t0
+
+
+# ================= ГЕНЕРАЦИЯ ПРОМОКОДОВ =================
+def gen_code(length=8):
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        code = "".join(random.choice(alphabet) for _ in range(length))
+        if code not in promos:
+            return code
+
+
+# ================= ГРАФИКИ =================
+def make_graph(values, width=20):
+    if not values:
+        return "нет данных"
+    mx = max(v for _, v in values) or 1
+    lines = []
+    for label, v in values:
+        n = int(round(v / mx * width)) if mx else 0
+        lines.append(f"{label} │{'█' * n}{'░' * (width - n)}│ {v}")
+    return "\n".join(lines)
+
+
+def stats_graph_text(period="week"):
+    today = datetime.now(MSK).date()
+    if period == "day":
+        days = 1
+    elif period == "week":
+        days = 7
+    elif period == "month":
+        days = 30
+    else:
+        days = 7
+    seq = []
+    for i in range(days - 1, -1, -1):
+        d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        h = history.get(d, {})
+        seq.append((
+            d[5:],
+            h.get("searches", 0),
+            h.get("new_users", 0),
+            len(h.get("active_users", [])),
+        ))
+    searches = [(lbl, s) for lbl, s, _, _ in seq]
+    newusers = [(lbl, n) for lbl, _, n, _ in seq]
+    active = [(lbl, a) for lbl, _, _, a in seq]
+    txt = (
+        f"📈 <b>СТАТИСТИКА · {period.upper()}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "<b>🔎 Поиски:</b>\n<code>"
+        + make_graph(searches, width=15) +
+        "</code>\n\n<b>🆕 Новые юзеры:</b>\n<code>"
+        + make_graph(newusers, width=15) +
+        "</code>\n\n<b>👥 Активные:</b>\n<code>"
+        + make_graph(active, width=15) +
+        "</code>\n"
+    )
+    return txt
+
+
+# ================= РАССЫЛКА =================
+async def do_broadcast(text, status_msg=None):
+    global broadcast
+    broadcast = {"running": True, "text": text, "total": len(users), "sent": 0, "failed": 0}
+    save_broadcast()
+    last_edit = [0.0]
+
+    for uid in list(users.keys()):
+        try:
+            await client.send_message(int(uid), text, parse_mode="html")
+            broadcast["sent"] += 1
+        except Exception:
+            broadcast["failed"] += 1
+        if status_msg and time.time() - last_edit[0] > 2:
+            last_edit[0] = time.time()
+            p = (broadcast["sent"] + broadcast["failed"]) * 100 // max(1, broadcast["total"])
+            try:
+                await status_msg.edit(
+                    "📢 <b>РАССЫЛКА</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"{bar(p)} {p}%\n"
+                    f"✅ Отправлено: <b>{broadcast['sent']}</b>\n"
+                    f"❌ Ошибок: <b>{broadcast['failed']}</b>\n"
+                    f"👥 Всего: <b>{broadcast['total']}</b>",
+                    parse_mode="html")
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
+
+    broadcast["running"] = False
+    save_broadcast()
+
+
+# ================= БОТ =================
+client = TelegramClient("osint_session", API_ID, API_HASH)
+BOT_USERNAME = [""]
+
+
+def is_owner(e):
+    return bool(OWNER_ID) and e.sender_id == OWNER_ID
+
+
+def ref_link(uid):
+    uname = BOT_USERNAME[0]
+    return f"https://t.me/{uname}?start=ref_{uid}" if uname else f"https://t.me/?start=ref_{uid}"
+
+
+# ---------- МЕНЮ ----------
+def menu_text(owner=False, uid=None):
+    if owner:
+        return (
+            "👑 <b>ADMIN PANEL · RIZER SEARCH</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Область: <b>{esc(scope['db'] or 'все базы')}</b>\n\n"
+            "🔎 <i>Отправь текст — начну поиск</i>\n"
+            "📥 <i>Отправь файл или архив — добавлю в базу</i>\n"
+            "<i>(подпись к файлу = название базы)</i>"
+        )
+
+    u = get_user(uid)
+    if has_sub(u):
+        sub_line = f"│  👑 Подписка: <b>{human_time(sub_time_left(u))}</b>\n"
+    else:
+        sub_line = "│  👑 Подписка: <b>нет</b>\n"
+
+    return (
+        "🔎 <b>RIZER SEARCH</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "┌─ 💎 <b>ТВОЙ БАЛАНС</b>\n"
+        f"│  🎁 Бесплатных сегодня: <b>{free_left(u)}</b> / {DAILY_FREE}\n"
+        f"│  💠 Бонусных: <b>{u.get('balance', 0)}</b>\n"
+        f"{sub_line}"
+        f"│  🔎 Всего поисков: <b>{u.get('total_searches', 0)}</b>\n"
+        "└──────────────\n\n"
+        "🔎 <i>Отправь текст — начну поиск</i>"
+    )
+
+
+def menu_buttons(owner=False):
+    if owner:
+        return [
+            [Button.inline("🔎 Поиск", b"find"), Button.inline("👤 Профиль", b"profile")],
+            [Button.inline("📂 Базы", b"bases"), Button.inline("🎯 Область", b"scope")],
+            [Button.inline("🎟 Промокоды", b"promo_menu"), Button.inline("📊 Статистика", b"stat")],
+            [Button.inline("📢 Рассылка", b"bc_menu"), Button.inline("👥 Юзеры", b"user_menu")],
+            [Button.inline("🆘 Поддержка", b"support"), Button.inline("🗑 Удалить базу", b"del")],
+            [Button.inline("❓ Помощь", b"help")],
+        ]
+    # Обычным юзерам — БЕЗ кнопки "Базы", с Поддержкой
+    return [
+        [Button.inline("🔎 Поиск", b"find"), Button.inline("👤 Профиль", b"profile")],
+        [Button.inline("🎟 Промокод", b"promo_enter"), Button.inline("💎 Подписка", b"sub_menu")],
+        [Button.inline("🤝 Рефералы", b"ref"), Button.inline("🆘 Поддержка", b"support")],
+        [Button.inline("❓ Помощь", b"help")],
+    ]
+
+
+def profile_text(user):
+    uid = str(getattr(user, "id", 0))
+    u = get_user(uid, getattr(user, "username", None))
+    name = " ".join(x for x in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if x) or "Пользователь"
+    owner = (uid == str(OWNER_ID))
+    up = int(time.time() - STARTED)
+    h, m = up // 3600, up % 3600 // 60
+    sub_line = (
+        f"👑 Подписка: <b>{human_time(sub_time_left(u))}</b>\n"
+        if has_sub(u) else "👑 Подписка: <b>нет</b>\n"
+    )
+    return (
+        "👤 <b>ПРОФИЛЬ</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🙍 Имя: <b>{esc(name)}</b>\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        + (f"🔗 @{esc(u['username'])}\n" if u.get("username") else "")
+        + f"🎖 Статус: <b>{'👑 Администратор' if owner else '👤 Пользователь'}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🎁 Бесплатных сегодня: <b>{free_left(u)}</b> / {DAILY_FREE}\n"
+        f"💠 Бонусных: <b>{u.get('balance', 0)}</b>\n"
+        f"{sub_line}"
+        f"🔎 Всего поисков: <b>{u.get('total_searches', 0)}</b>\n"
+        f"🤝 Приглашено: <b>{len(u.get('refs', []))}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 Аптайм: <b>{h} ч {m} мин</b>"
+    )
+
+
+BACK = [[Button.inline("⬅️ В меню", b"menu")]]
+
+HELP = (
+    "❓ <b>ПОМОЩЬ · АДМИН</b>\n━━━━━━━━━━━━━━━━━━\n"
+    "📥 <b>Добавить базу</b> — пришли файл.\n\n"
+    "🔎 <b>Поиск</b> — любой текст.\n\n"
+    "🎯 <b>Область</b> — по всем или по одной базе.\n\n"
+    "🎟 <b>Промокоды</b> — создание кодов на запросы.\n\n"
+    "📢 <b>Рассылка</b> — сообщение всем юзерам.\n\n"
+    "👥 <b>Юзеры</b> — список, бан, разбан, выдача подписки.\n\n"
+    "📊 <b>Статистика</b> — графики и топ.\n\n"
+    "📄 Результаты поиска всегда приходят файлом.\n\n"
+    "🆘 <b>Поддержка:</b> @" + SUPPORT_USERNAME
+)
+
+HELP_USER = (
+    "❓ <b>ПОМОЩЬ</b>\n━━━━━━━━━━━━━━━━━━\n"
+    f"🎁 Каждый день — <b>{DAILY_FREE} бесплатных запроса</b> (сброс 00:00 МСК).\n\n"
+    "🎟 <b>Промокод</b> — код на бонусные запросы.\n\n"
+    f"🤝 <b>Рефералы</b> — +{REF_BONUS} запросов тебе и другу.\n\n"
+    "💎 <b>Подписка</b> — безлимит на срок (день/неделя/месяц/навсегда).\n\n"
+    "🔎 <b>Поиск</b> — просто отправь текст.\n\n"
+    "📄 Результаты всегда приходят файлом.\n\n"
+    "🆘 <b>Поддержка:</b> @" + SUPPORT_USERNAME
+)
+
+
+async def show_menu(e, edit=False):
+    owner = is_owner(e)
+    uid = e.sender_id
+    text = menu_text(owner, uid)
+    btns = menu_buttons(owner)
+    if edit:
+        try:
+            await e.edit(text, buttons=btns, parse_mode="html")
+        except Exception:
+            try:
+                if os.path.exists(LOGO_PATH):
+                    await client.send_file(e.chat_id, LOGO_PATH, caption=text,
+                                           buttons=btns, parse_mode="html")
+                else:
+                    await e.reply(text, buttons=btns, parse_mode="html")
+            except Exception:
+                pass
+    else:
+        if os.path.exists(LOGO_PATH):
+            try:
+                await client.send_file(e.chat_id, LOGO_PATH, caption=text,
+                                       buttons=btns, parse_mode="html")
+                return
+            except Exception:
+                pass
+        await e.reply(text, buttons=btns, parse_mode="html")
+
+
+# ---------- СТАРТ / РЕФЕРАЛ ----------
+@client.on(events.NewMessage(pattern=r"^/(start|menu|admin)", func=lambda e: e.is_private))
+async def start(e):
+    uid = str(e.sender_id)
+    uname = (await e.get_sender()).username or ""
+    u = get_user(uid, uname)
+
+    if is_banned(u):
+        await e.reply(
+            f"🚫 <b>Ты забанен.</b>\n"
+            f"Причина: {esc(u.get('ban_reason') or 'не указана')}",
+            parse_mode="html")
+        return
+
+    args = e.text.split(maxsplit=1)
+    if len(args) > 1 and args[1].startswith("ref_"):
+        ref_id = args[1][4:]
+        if ref_id.isdigit() and ref_id != uid and ref_id in users:
+            if not u.get("ref_by"):
+                u["ref_by"] = ref_id
+                u["balance"] = int(u.get("balance", 0)) + REF_BONUS
+                users[ref_id]["balance"] = int(users[ref_id].get("balance", 0)) + REF_BONUS
+                if uid not in users[ref_id].get("refs", []):
+                    users[ref_id].setdefault("refs", []).append(uid)
+                save_users()
+                try:
+                    await client.send_message(
+                        int(ref_id),
+                        f"🤝 <b>Новый реферал!</b>\n"
+                        f"👤 {esc(uname or 'id'+uid)} присоединился.\n"
+                        f"💠 Тебе <b>+{REF_BONUS}</b>, ему тоже <b>+{REF_BONUS}</b>.",
+                        parse_mode="html")
+                except Exception:
+                    pass
+                await e.reply(
+                    f"🎉 <b>Добро пожаловать!</b>\n"
+                    f"Ты пришёл по реферальной ссылке и получил <b>+{REF_BONUS}</b> запросов.",
+                    parse_mode="html")
+
+    mark_active(uid)
+
+    owner = is_owner(e)
+    text = menu_text(owner, uid)
+    btns = menu_buttons(owner)
+
+    if os.path.exists(LOGO_PATH):
+        try:
+            await client.send_file(e.chat_id, LOGO_PATH, caption=text,
+                                   buttons=btns, parse_mode="html")
+            return
+        except Exception:
+            pass
+    await e.reply(text, buttons=btns, parse_mode="html")
+
+
+# ---------- ЗАГРУЗКА ----------
+@client.on(events.NewMessage(func=lambda e: e.is_private and e.document))
+async def upload(e):
+    if not is_owner(e):
+        u = get_user(e.sender_id)
+        if is_banned(u):
+            await e.reply("🚫 Ты забанен.", parse_mode="html")
+            return
+        await e.reply("⛔ <b>Загрузка баз доступна только администратору.</b>", parse_mode="html")
+        return
+    name = (e.file.name if e.file and e.file.name else "file")
+    dbname = safe(e.text) if e.text else safe(os.path.splitext(name)[0])
+    msg = await e.reply(f"📥 <b>Принимаю</b> {esc(name)}…", parse_mode="html")
+    work = tempfile.mkdtemp(dir=TMP_DIR)
+    last = [0.0]
+
+    async def cb(cur, total):
+        if time.time() - last[0] < 3:
+            return
+        last[0] = time.time()
+        p = cur * 100 // total if total else 0
+        try:
+            await msg.edit(f"📥 <b>{esc(name)}</b>\n{bar(p)} {p}% · {hs(cur)} / {hs(total)}", parse_mode="html")
+        except Exception:
+            pass
+
+    try:
+        src = os.path.join(work, name)
+        await e.download_media(file=src, progress_callback=cb)
+        await msg.edit("⚙️ <b>Обрабатываю и добавляю в базу…</b>", parse_mode="html")
+        st = await asyncio.get_running_loop().run_in_executor(None, process_upload, src, name, dbname)
+        stats['uploads'] += 1
+        save_stats()
+        files, size = base_info(dbname)
+        await msg.edit(
+            "✅ <b>БАЗА ОБНОВЛЕНА</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"📁 База: <b>{esc(dbname)}</b>\n"
+            f"➕ Добавлено файлов: <b>{st['added']}</b>\n"
+            f"⏭ Пропущено: <b>{st['skipped']}</b>\n"
+            f"📦 Размер базы: <b>{hs(size)}</b> ({files} ф.)",
+            buttons=BACK, parse_mode="html")
+    except Exception as ex:
+        await msg.edit(f"❌ <b>Ошибка:</b> {esc(ex)}", buttons=BACK, parse_mode="html")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------- WAIT-состояния ----------
+WAIT_PROMO = {}
+WAIT_PROMO_CREATE = {}
+WAIT_BC = {}
+WAIT_BAN_ID = {}
+WAIT_BAN_REASON = {}
+WAIT_UNBAN_ID = {}
+WAIT_SUB_ID = {}
+WAIT_SUB_DAYS = {}
+
+
+# ---------- ПОИСК + ТЕКСТОВЫЕ ВВОДЫ ----------
+@client.on(events.NewMessage(func=lambda e: e.is_private and not e.document
+                             and e.text and not e.text.startswith("/")))
+async def search(e):
+    q = e.text.strip()
+    uid = str(e.sender_id)
+    uname = (await e.get_sender()).username or ""
+    u = get_user(uid, uname)
+
+    # BAN
+    if is_banned(u) and not is_owner(e):
+        await e.reply(
+            f"🚫 <b>Ты забанен.</b>\n"
+            f"Причина: {esc(u.get('ban_reason') or 'не указана')}",
+            parse_mode="html")
+        return
+
+    # Промокод
+    if WAIT_PROMO.get(uid):
+        WAIT_PROMO.pop(uid, None)
+        code = q.strip().upper()
+        if code in promos and promos[code].get("left", 0) > 0:
+            amount = int(promos[code]["left"])
+            u["balance"] = int(u.get("balance", 0)) + amount
+            promos[code]["left"] = 0
+            promos[code]["uses"] = promos[code].get("uses", 0) + 1
+            save_users()
+            save_promos()
+            await e.reply(
+                "🎉 <b>ПРОМОКОД АКТИВИРОВАН!</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"🎟 Код: <code>{esc(code)}</code>\n"
+                f"💠 Начислено: <b>+{amount}</b>\n"
+                f"💎 Бонусный баланс: <b>{u['balance']}</b>",
+                buttons=[[Button.inline("🔎 Искать", b"find"), Button.inline("⬅️ В меню", b"menu")]],
+                parse_mode="html")
+        else:
+            await e.reply(
+                "❌ <b>Неверный или использованный промокод.</b>",
+                buttons=[[Button.inline("🎟 Ещё раз", b"promo_enter"), Button.inline("⬅️ В меню", b"menu")]],
+                parse_mode="html")
+        return
+
+    # Создание промокода
+    if WAIT_PROMO_CREATE.get(uid):
+        step = WAIT_PROMO_CREATE[uid]
+        if step == "amount":
+            if not q.isdigit() or int(q) <= 0:
+                await e.reply("❌ Введи положительное число.", buttons=BACK, parse_mode="html")
+                return
+            WAIT_PROMO_CREATE[uid] = ("gen", int(q))
+            await e.reply(
+                "🎟 <b>СОЗДАНИЕ ПРОМОКОДА</b>\n"
+                f"💠 Запросов: <b>{q}</b>\n\n"
+                "Отправь текст кода (напр. <code>OSINT50</code>)\n"
+                "или напиши <code>auto</code>.",
+                buttons=BACK, parse_mode="html")
+            return
+        elif isinstance(step, tuple) and step[0] == "gen":
+            amount = step[1]
+            code = q.strip().upper() if q.strip().lower() != "auto" else gen_code()
+            if code in promos:
+                await e.reply("❌ Такой промокод уже есть.", buttons=BACK, parse_mode="html")
+                return
+            promos[code] = {"uses": 0, "left": amount, "created": int(time.time())}
+            save_promos()
+            WAIT_PROMO_CREATE.pop(uid, None)
+            await e.reply(
+                "✅ <b>ПРОМОКОД СОЗДАН</b>\n"
+                f"🎟 Код: <code>{esc(code)}</code>\n"
+                f"💠 Запросов: <b>{amount}</b>",
+                buttons=[[Button.inline("🎟 К промокодам", b"promo_menu"), Button.inline("⬅️ В меню", b"menu")]],
+                parse_mode="html")
+            return
+
+    # Рассылка
+    if WAIT_BC.get(uid):
+        WAIT_BC.pop(uid, None)
+        text = q
+        msg = await e.reply(
+            "📢 <b>РАССЫЛКА ЗАПУЩЕНА</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"{bar(0)} 0%\n"
+            f"✅ Отправлено: <b>0</b>\n"
+            f"❌ Ошибок: <b>0</b>\n"
+            f"👥 Всего: <b>{len(users)}</b>",
+            parse_mode="html")
+        asyncio.create_task(do_broadcast(text, msg))
+        return
+
+    # Бан: ID
+    if WAIT_BAN_ID.get(uid):
+        WAIT_BAN_ID.pop(uid, None)
+        target = q.strip().lstrip("@")
+        if target not in users:
+            await e.reply("❌ Не найден. Введи ID или @username.", buttons=BACK, parse_mode="html")
+            return
+        WAIT_BAN_REASON[uid] = target
+        await e.reply(
+            f"🚫 <b>БАН ЮЗЕРА</b>\n"
+            f"👤 ID: <code>{target}</code>\n\n"
+            "Отправь причину бана (или <code>-</code> чтобы без причины):",
+            buttons=[[Button.inline("⬅️ Отмена", b"user_menu")]],
+            parse_mode="html")
+        return
+
+    # Бан: причина
+    if WAIT_BAN_REASON.get(uid):
+        target = WAIT_BAN_REASON.pop(uid, None)
+        reason = "" if q.strip() == "-" else q.strip()
+        if target in users:
+            users[target]["banned"] = True
+            users[target]["ban_reason"] = reason
+            save_users()
+        await e.reply(
+            f"✅ <b>Юзер <code>{target}</code> забанен</b>\n"
+            f"Причина: {esc(reason or '—')}",
+            buttons=[[Button.inline("⬅️ В меню", b"menu")]],
+            parse_mode="html")
+        return
+
+    # Разбан
+    if WAIT_UNBAN_ID.get(uid):
+        WAIT_UNBAN_ID.pop(uid, None)
+        target = q.strip().lstrip("@")
+        if target not in users:
+            await e.reply("❌ Не найден.", buttons=BACK, parse_mode="html")
+            return
+        users[target]["banned"] = False
+        users[target]["ban_reason"] = ""
+        save_users()
+        await e.reply(
+            f"✅ <b>Юзер <code>{target}</code> разбанен</b>",
+            buttons=[[Button.inline("⬅️ В меню", b"menu")]],
+            parse_mode="html")
+        return
+
+    # Выдача подписки: ID
+    if WAIT_SUB_ID.get(uid):
+        WAIT_SUB_ID.pop(uid, None)
+        target = q.strip().lstrip("@")
+        if target not in users:
+            await e.reply("❌ Не найден.", buttons=BACK, parse_mode="html")
+            return
+        WAIT_SUB_DAYS[uid] = target
+        rows = []
+        for key, cfg in SUB_PRICES.items():
+            rows.append([Button.inline(f"{cfg['name']} · {cfg['days']} дн.", f"subg:{key}".encode())])
+        rows.append([Button.inline("⬅️ Отмена", b"user_menu")])
+        await e.reply(
+            f"💎 <b>ВЫДАЧА ПОДПИСКИ</b>\n"
+            f"👤 Юзер: <code>{target}</code>\n\n"
+            "Выбери срок:",
+            buttons=rows, parse_mode="html")
+        return
+
+    # Обычный поиск
+    if not list_bases():
+        await e.reply("📭 <b>Баз пока нет.</b>", parse_mode="html")
+        return
+
+    if not is_owner(e) and total_left(u) <= 0:
+        await e.reply(
+            "💔 <b>Запросы закончились!</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🎁 Бесплатных сегодня: <b>0</b> / {DAILY_FREE}\n"
+            f"💠 Бонусных: <b>0</b>\n\n"
+            "🎟 Активировать промокод\n"
+            f"🤝 Пригласить друга (+{REF_BONUS})\n"
+            "💎 Купить подписку\n"
+            "⏰ Или подождать до 00:00 МСК.",
+            buttons=[[Button.inline("🎟 Промокод", b"promo_enter"),
+                      Button.inline("💎 Подписка", b"sub_menu")],
+                     [Button.inline("🤝 Рефералы", b"ref"),
+                      Button.inline("🆘 Поддержка", b"support")],
+                     [Button.inline("⬅️ В меню", b"menu")]],
+            parse_mode="html")
+        return
+
+    db = scope["db"]
+    if db and not os.path.isdir(os.path.join(DB_DIR, db)):
+        scope["db"] = db = None
+
+    if not is_owner(e):
+        consume_query(u)
+    stats['searches'] += 1
+    stats['last_query'] = q[:60]
+    save_stats()
+    touch_history("searches")
+    mark_active(uid)
+
+    msg = await e.reply(f"🔎 <b>Ищу:</b> <code>{esc(q)}</code>…", parse_mode="html")
+    count, preview, path, took = await asyncio.get_running_loop().run_in_executor(None, run_search, q, db)
+
+    left_info = ""
+    if not is_owner(e):
+        if has_sub(u):
+            left_info = f"\n👑 Подписка: <b>{human_time(sub_time_left(u))}</b>"
+        else:
+            left_info = (f"\n🎁 Осталось сегодня: <b>{free_left(u)}</b>"
+                         f" · 💠 Бонус: <b>{u.get('balance', 0)}</b>")
+
+    head = (
+        "🔎 <b>РЕЗУЛЬТАТЫ ПОИСКА</b>\n━━━━━━━━━━━━━━━━━━\n"
+        f"💬 Запрос: <code>{esc(q)}</code>\n"
+        f"🎯 Область: <b>{esc(db or 'все базы')}</b>\n"
+        f"✅ Найдено: <b>{count}</b> · ⏱ {took:.1f} с"
+        f"{left_info}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if not count:
+        try:
+            await msg.edit(head + "❌ <i>Ничего не найдено</i>", buttons=BACK, parse_mode="html")
+        except Exception:
+            await e.reply(head + "❌ <i>Ничего не найдено</i>", buttons=BACK, parse_mode="html")
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+        return
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    caption = (
+        "🔎 <b>РЕЗУЛЬТАТЫ ПОИСКА</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💬 Запрос: <code>{esc(q)}</code>\n"
+        f"🎯 Область: <b>{esc(db or 'все базы')}</b>\n"
+        f"✅ Найдено строк: <b>{count}</b>\n"
+        f"⏱ Время: <b>{took:.1f} с</b>"
+        f"{left_info}"
+    )
+    try:
+        await client.send_file(
+            e.chat_id,
+            path,
+            force_document=True,
+            caption=caption,
+            buttons=BACK,
+            parse_mode="html")
+    except Exception as ex:
+        await e.reply(f"❌ Ошибка отправки файла: {esc(ex)}", parse_mode="html")
+    finally:
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+
+# ---------- CALLBACK ----------
+@client.on(events.CallbackQuery)
+async def cbq(e):
+    d = e.data.decode()
+    owner = is_owner(e)
+    uid = str(e.sender_id)
+    bases = list_bases()
+
+    ADMIN_ONLY = {"scope", "del", "stat", "promo_menu", "promo_create",
+                  "bc_menu", "bc_start", "user_menu", "ban_start", "unban_start",
+                  "sub_give", "stat_day", "stat_week", "stat_month", "user_list",
+                  "bases"}
+    if (d in ADMIN_ONLY or d.startswith("sc:") or d.startswith("dl:") or d.startswith("ok:")
+            or d.startswith("promo_del:") or d.startswith("subg:")):
+        if not owner:
+            return await e.answer("⛔ Только для администратора", alert=True)
+
+    u = get_user(uid)
+    if is_banned(u) and not owner and d not in {"menu", "support"}:
+        return await e.answer("🚫 Ты забанен", alert=True)
+
+    try:
+        if d == "menu":
+            for k in (WAIT_PROMO, WAIT_PROMO_CREATE, WAIT_BC, WAIT_BAN_ID, WAIT_BAN_REASON,
+                      WAIT_UNBAN_ID, WAIT_SUB_ID, WAIT_SUB_DAYS):
+                k.pop(uid, None)
+            await show_menu(e, edit=True)
+
+        elif d == "find":
+            await e.edit("🔎 <b>ПОИСК</b>\n━━━━━━━━━━━━━━━━━━\n"
+                         f"🎯 Область: <b>{esc(scope['db'] or 'все базы')}</b>\n\n"
+                         "✍️ <i>Отправь текст для поиска.</i>",
+                         buttons=BACK, parse_mode="html")
+
+        elif d == "profile":
+            us = await e.get_sender()
+            await e.edit(profile_text(us), buttons=BACK, parse_mode="html")
+
+        elif d == "help":
+            await e.edit(HELP if owner else HELP_USER, buttons=BACK, parse_mode="html")
+
+        elif d == "support":
+            await e.edit(
+                "🆘 <b>ПОДДЕРЖКА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "💬 Есть вопросы, проблемы или предложения?\n\n"
+                "📩 По всем вопросам пиши:\n"
+                f"👉 <b>@{SUPPORT_USERNAME}</b>\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🕐 <i>Отвечаю в порядке очереди</i>\n"
+                "⚠️ <i>Технические вопросы, оплата, восстановление доступа</i>",
+                buttons=[
+                    [Button.url("💬 Написать в поддержку", SUPPORT_LINK)],
+                    [Button.inline("⬅️ В меню", b"menu")],
+                ],
+                parse_mode="html")
+
+        elif d == "bases":
+            if not bases:
+                txt = "📭 <b>Баз пока нет.</b>"
+            else:
+                txt = "📂 <b>МОИ БАЗЫ</b>\n━━━━━━━━━━━━━━━━━━\n"
+                for b in bases:
+                    f, s = base_info(b)
+                    txt += f"📁 <b>{esc(b)}</b> — {f} ф. · {hs(s)}\n"
+            await e.edit(txt, buttons=BACK, parse_mode="html")
+
+        elif d == "ref":
+            u2 = get_user(uid)
+            link = ref_link(uid)
+            refs = u2.get("refs", [])
+            txt = (
+                "🤝 <b>РЕФЕРАЛЬНАЯ ПРОГРАММА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"💎 За каждого друга — <b>+{REF_BONUS}</b> тебе и ему!\n\n"
+                f"🔗 <b>Твоя ссылка:</b>\n<code>{esc(link)}</code>\n\n"
+                f"👥 Приглашено: <b>{len(refs)}</b>\n"
+                f"💠 Заработано: <b>{len(refs) * REF_BONUS}</b>\n"
+                "━━━━━━━━━━━━━━━━━━"
+            )
+            await e.edit(txt, buttons=[[Button.inline("⬅️ В меню", b"menu")]], parse_mode="html")
+
+        elif d == "promo_enter":
+            WAIT_PROMO[uid] = True
+            await e.edit(
+                "🎟 <b>АКТИВАЦИЯ ПРОМОКОДА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "✍️ Отправь промокод сообщением.",
+                buttons=[[Button.inline("⬅️ В меню", b"menu")]],
+                parse_mode="html")
+
+        elif d == "sub_menu":
+            u2 = get_user(uid)
+            rows = []
+            for key, cfg in SUB_PRICES.items():
+                rows.append([Button.inline(
+                    f"💎 {cfg['name']} — {cfg['price']} ⭐",
+                    f"subbuy:{key}".encode())])
+            rows.append([Button.inline("⬅️ В меню", b"menu")])
+            cur = human_time(sub_time_left(u2)) if has_sub(u2) else "нет"
+            await e.edit(
+                "💎 <b>ПОДПИСКА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👑 Текущая: <b>{cur}</b>\n\n"
+                "Что даёт подписка:\n"
+                "♾ Безлимитные поиски\n"
+                "🚀 Приоритетная обработка\n\n"
+                "Выбери тариф:",
+                buttons=rows, parse_mode="html")
+
+        elif d.startswith("subbuy:"):
+            key = d.split(":", 1)[1]
+            cfg = SUB_PRICES.get(key)
+            if not cfg:
+                return await e.answer("Тариф не найден", alert=True)
+            u2 = get_user(uid)
+            uname = u2.get("username") or f"id{uid}"
+            try:
+                await client.send_message(
+                    OWNER_ID,
+                    f"💎 <b>НОВАЯ ЗАЯВКА НА ПОДПИСКУ</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 Юзер: @{esc(uname)}\n"
+                    f"🆔 ID: <code>{uid}</code>\n"
+                    f"📦 Тариф: <b>{cfg['name']}</b>\n"
+                    f"💰 Цена: <b>{cfg['price']} ⭐</b>\n\n"
+                    "Выдай подписку через 👥 Юзеры → 💎 Выдать подписку.",
+                    parse_mode="html")
+            except Exception:
+                pass
+            await e.edit(
+                "✅ <b>ЗАЯВКА ОТПРАВЛЕНА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"📦 Тариф: <b>{cfg['name']}</b>\n"
+                f"💰 Цена: <b>{cfg['price']} ⭐</b>\n\n"
+                "Свяжись с поддержкой для оплаты:",
+                buttons=[
+                    [Button.url("💬 Написать в поддержку", SUPPORT_LINK)],
+                    [Button.inline("⬅️ В меню", b"menu")],
+                ],
+                parse_mode="html")
+
+        elif d == "promo_menu":
+            await cbq_show_promos(e)
+
+        elif d == "promo_create":
+            WAIT_PROMO_CREATE[uid] = "amount"
+            await e.edit(
+                "➕ <b>СОЗДАНИЕ ПРОМОКОДА</b>\n"
+                "✍️ Отправь <b>число запросов</b> для кода:",
+                buttons=[[Button.inline("⬅️ Отмена", b"promo_menu")]],
+                parse_mode="html")
+
+        elif d == "promo_del_list":
+            if not promos:
+                return await e.answer("Промокодов нет", alert=True)
+            rows = []
+            for code in list(promos.keys())[:40]:
+                rows.append([Button.inline(f"🗑 {code}", f"promo_del:{code}".encode())])
+            rows.append([Button.inline("⬅️ Назад", b"promo_menu")])
+            await e.edit("🗑 <b>УДАЛЕНИЕ ПРОМОКОДА</b>", buttons=rows, parse_mode="html")
+
+        elif d.startswith("promo_del:"):
+            code = d.split(":", 1)[1]
+            if code in promos:
+                del promos[code]
+                save_promos()
+            await e.answer("Удалено")
+            await cbq_show_promos(e)
+
+        elif d == "bc_menu":
+            txt = (
+                "📢 <b>РАССЫЛКА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👥 Получателей: <b>{len(users)}</b>\n\n"
+                + ("⚠️ <b>Рассылка уже идёт!</b>\n"
+                   f"✅ Отправлено: <b>{broadcast['sent']}</b>\n"
+                   f"❌ Ошибок: <b>{broadcast['failed']}</b>\n"
+                   f"👥 Всего: <b>{broadcast['total']}</b>\n"
+                   if broadcast.get("running") else
+                   "Готов отправить сообщение всем юзерам.\n")
+            )
+            rows = []
+            if not broadcast.get("running"):
+                rows.append([Button.inline("✉️ Написать всем", b"bc_start")])
+            rows.append([Button.inline("⬅️ В меню", b"menu")])
+            await e.edit(txt, buttons=rows, parse_mode="html")
+
+        elif d == "bc_start":
+            WAIT_BC[uid] = True
+            await e.edit(
+                "📢 <b>РАССЫЛКА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "✍️ Отправь сообщение для рассылки.\n"
+                "Поддерживается HTML.\n\n"
+                f"👥 Получателей: <b>{len(users)}</b>",
+                buttons=[[Button.inline("⬅️ Отмена", b"bc_menu")]],
+                parse_mode="html")
+
+        elif d == "user_menu":
+            total = len(users)
+            banned = sum(1 for x in users.values() if x.get("banned"))
+            withsub = sum(1 for x in users.values() if has_sub(x))
+            txt = (
+                "👥 <b>УПРАВЛЕНИЕ ЮЗЕРАМИ</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👤 Всего: <b>{total}</b>\n"
+                f"🚫 Забанено: <b>{banned}</b>\n"
+                f"👑 С подпиской: <b>{withsub}</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Выбери действие:"
+            )
+            rows = [
+                [Button.inline("📋 Список юзеров", b"user_list")],
+                [Button.inline("🚫 Забанить", b"ban_start"),
+                 Button.inline("✅ Разбанить", b"unban_start")],
+                [Button.inline("💎 Выдать подписку", b"sub_give")],
+                [Button.inline("⬅️ В меню", b"menu")],
+            ]
+            await e.edit(txt, buttons=rows, parse_mode="html")
+
+        elif d == "user_list":
+            sorted_users = sorted(users.values(), key=lambda x: -int(x.get("total_searches", 0)))[:20]
+            txt = "📋 <b>ТОП-20 ЮЗЕРОВ</b>\n━━━━━━━━━━━━━━━━━━\n"
+            for i, x in enumerate(sorted_users, 1):
+                nm = f"@{x['username']}" if x.get("username") else f"id{x['id']}"
+                flags = ""
+                if x.get("banned"):
+                    flags += "🚫"
+                if has_sub(x):
+                    flags += "👑"
+                txt += f"{i}. {esc(nm)} {flags} — <b>{x.get('total_searches', 0)}</b> 🔎\n"
+            rows = [[Button.inline("⬅️ Назад", b"user_menu")]]
+            await e.edit(txt, buttons=rows, parse_mode="html")
+
+        elif d == "ban_start":
+            WAIT_BAN_ID[uid] = True
+            await e.edit(
+                "🚫 <b>БАН ЮЗЕРА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "Отправь <b>ID</b> или <b>@username</b> юзера:",
+                buttons=[[Button.inline("⬅️ Отмена", b"user_menu")]],
+                parse_mode="html")
+
+        elif d == "unban_start":
+            WAIT_UNBAN_ID[uid] = True
+            await e.edit(
+                "✅ <b>РАЗБАН ЮЗЕРА</b>\n"
+                "Отправь <b>ID</b> или <b>@username</b>:",
+                buttons=[[Button.inline("⬅️ Отмена", b"user_menu")]],
+                parse_mode="html")
+
+        elif d == "sub_give":
+            WAIT_SUB_ID[uid] = True
+            await e.edit(
+                "💎 <b>ВЫДАЧА ПОДПИСКИ</b>\n"
+                "Отправь <b>ID</b> или <b>@username</b>:",
+                buttons=[[Button.inline("⬅️ Отмена", b"user_menu")]],
+                parse_mode="html")
+
+        elif d.startswith("subg:"):
+            key = d.split(":", 1)[1]
+            cfg = SUB_PRICES.get(key)
+            target = WAIT_SUB_DAYS.get(uid)
+            if not cfg or not target:
+                return await e.answer("Ошибка", alert=True)
+            WAIT_SUB_DAYS.pop(uid, None)
+            until = add_sub(target, cfg["days"])
+            try:
+                await client.send_message(
+                    int(target),
+                    f"🎉 <b>ТЕБЕ ВЫДАНА ПОДПИСКА!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 Тариф: <b>{cfg['name']}</b>\n"
+                    f"♾ Безлимитные поиски активированы!\n"
+                    f"🕒 До: <b>{datetime.fromtimestamp(until, MSK).strftime('%d.%m.%Y %H:%M')}</b>",
+                    parse_mode="html")
+            except Exception:
+                pass
+            await e.edit(
+                f"✅ <b>ПОДПИСКА ВЫДАНА</b>\n"
+                f"👤 Юзер: <code>{target}</code>\n"
+                f"📦 {cfg['name']} · до {datetime.fromtimestamp(until, MSK).strftime('%d.%m.%Y')}",
+                buttons=[[Button.inline("⬅️ В меню", b"menu")]],
+                parse_mode="html")
+
+        elif d == "stat":
+            total_users = len(users)
+            total_refs = sum(len(x.get("refs", [])) for x in users.values())
+            total_balance = sum(int(x.get("balance", 0)) for x in users.values())
+            total_searches = sum(int(x.get("total_searches", 0)) for x in users.values())
+            banned = sum(1 for x in users.values() if x.get("banned"))
+            withsub = sum(1 for x in users.values() if has_sub(x))
+            top = sorted(users.values(), key=lambda x: -int(x.get("total_searches", 0)))[:5]
+            txt = (
+                "📊 <b>ОБЩАЯ СТАТИСТИКА</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"👥 Юзеров: <b>{total_users}</b>\n"
+                f"🚫 Забанено: <b>{banned}</b>\n"
+                f"👑 С подпиской: <b>{withsub}</b>\n"
+                f"🔎 Поисков: <b>{total_searches}</b>\n"
+                f"💠 Бонусов: <b>{total_balance}</b>\n"
+                f"🤝 Рефералов: <b>{total_refs}</b>\n"
+                f"🎟 Промокодов: <b>{len(promos)}</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🏆 <b>ТОП-5:</b>\n"
+            )
+            for i, x in enumerate(top, 1):
+                nm = f"@{x['username']}" if x.get("username") else f"id{x['id']}"
+                txt += f"{i}. {esc(nm)} — <b>{x.get('total_searches', 0)}</b>\n"
+            rows = [
+                [Button.inline("📅 День", b"stat_day"),
+                 Button.inline("📅 Неделя", b"stat_week"),
+                 Button.inline("📅 Месяц", b"stat_month")],
+                [Button.inline("⬅️ В меню", b"menu")],
+            ]
+            await e.edit(txt, buttons=rows, parse_mode="html")
+
+        elif d == "stat_day":
+            await e.edit(stats_graph_text("day"),
+                         buttons=[[Button.inline("⬅️ Назад", b"stat"), Button.inline("⬅️ В меню", b"menu")]],
+                         parse_mode="html")
+
+        elif d == "stat_week":
+            await e.edit(stats_graph_text("week"),
+                         buttons=[[Button.inline("⬅️ Назад", b"stat"), Button.inline("⬅️ В меню", b"menu")]],
+                         parse_mode="html")
+
+        elif d == "stat_month":
+            await e.edit(stats_graph_text("month"),
+                         buttons=[[Button.inline("⬅️ Назад", b"stat"), Button.inline("⬅️ В меню", b"menu")]],
+                         parse_mode="html")
+
+        elif d == "scope":
+            rows = [[Button.inline(("✅ " if scope["db"] is None else "🌐 ") + "Все базы", b"sc:-1")]]
+            for i, b in enumerate(bases[:40]):
+                rows.append([Button.inline(("✅ " if scope["db"] == b else "📁 ") + b, f"sc:{i}".encode())])
+            rows.append([Button.inline("⬅️ В меню", b"menu")])
+            await e.edit("🎯 <b>ОБЛАСТЬ ПОИСКА</b>", buttons=rows, parse_mode="html")
+
+        elif d.startswith("sc:"):
+            i = int(d[3:])
+            scope["db"] = bases[i] if 0 <= i < len(bases) else None
+            await show_menu(e, edit=True)
+
+        elif d == "del":
+            if not bases:
+                return await e.answer("Баз нет", alert=True)
+            rows = [[Button.inline(f"🗑 {b}", f"dl:{i}".encode())] for i, b in enumerate(bases[:40])]
+            rows.append([Button.inline("⬅️ В меню", b"menu")])
+            await e.edit("🗑 <b>УДАЛЕНИЕ</b>\nКакую базу?", buttons=rows, parse_mode="html")
+
+        elif d.startswith("dl:"):
+            b = bases[int(d[3:])]
+            await e.edit(f"⚠️ Удалить <b>{esc(b)}</b> навсегда?",
+                         buttons=[[Button.inline("✅ Да", f"ok:{d[3:]}".encode()),
+                                   Button.inline("❌ Нет", b"menu")]], parse_mode="html")
+
+        elif d.startswith("ok:"):
+            b = bases[int(d[3:])]
+            shutil.rmtree(os.path.join(DB_DIR, b), ignore_errors=True)
+            if scope["db"] == b:
+                scope["db"] = None
+            await show_menu(e, edit=True)
+
+    except Exception as ex:
+        try:
+            await e.answer(f"Ошибка: {ex}", alert=True)
+        except Exception:
+            pass
+
+
+async def cbq_show_promos(e):
+    txt = "🎟 <b>УПРАВЛЕНИЕ ПРОМОКОДАМИ</b>\n━━━━━━━━━━━━━━━━━━\n"
+    if not promos:
+        txt += "<i>Промокодов нет.</i>\n"
+    else:
+        for c, p in list(promos.items())[:30]:
+            txt += f"🎫 <code>{esc(c)}</code> — <b>{p.get('left', 0)}</b> зап. · исп. {p.get('uses', 0)}\n"
+    txt += f"\n━━━━━━━━━━━━━━━━━━\n📊 Всего: <b>{len(promos)}</b>"
+    rows = [[Button.inline("➕ Создать", b"promo_create")]]
+    if promos:
+        rows.append([Button.inline("🗑 Удалить", b"promo_del_list")])
+    rows.append([Button.inline("⬅️ В меню", b"menu")])
+    try:
+        await e.edit(txt, buttons=rows, parse_mode="html")
+    except Exception:
+        pass
+
+
+# ================= ЗАПУСК =================
+async def main():
+    await client.start(bot_token=BOT_TOKEN)
+    me = await client.get_me()
+    BOT_USERNAME[0] = me.username or ""
+    print(f"RIZER SEARCH запущен. @{BOT_USERNAME[0]}")
+    if not os.path.exists(LOGO_PATH):
+        print(f"⚠️ Логотип не найден: {LOGO_PATH}")
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    client.loop.run_until_complete(main())
