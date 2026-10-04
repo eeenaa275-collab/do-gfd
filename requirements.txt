@@ -1,0 +1,5 @@
+telethon
+chardet
+openpyxl
+python-docx
+pypdf
